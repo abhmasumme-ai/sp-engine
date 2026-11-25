@@ -1,6 +1,8 @@
 import asyncio
 import re
 
+from config import BET_STAKE
+
 
 class MelbetEngine:
     # Fallback type hints (শুধু fallback — learning এর পর override হয়)
@@ -63,8 +65,15 @@ class MelbetEngine:
                     yield group_list
 
     @staticmethod
+    def _clean_num(v):
+        """'3.50' -> '3.5', '3.0' -> '3', but '10' stays '10' (no stripping without a decimal point)."""
+        s = str(v)
+        return s.rstrip("0").rstrip(".") if "." in s else s
+
+    @staticmethod
     def _param_strings(event):
         """Normalize all possible param fields into a set of strings."""
+        clean = MelbetEngine._clean_num
         ep = event.get("eventParams")
         raw = ep.get("params", []) if isinstance(ep, dict) else []
         out = set()
@@ -72,17 +81,17 @@ class MelbetEngine:
             for v in raw:
                 if isinstance(v, (str, int, float)):
                     out.add(str(v))
-                    out.add(str(v).rstrip("0").rstrip("."))
+                    out.add(clean(v))
                 elif isinstance(v, dict):
                     for vv in v.values():
                         if isinstance(vv, (str, int, float)):
                             out.add(str(vv))
-                            out.add(str(vv).rstrip("0").rstrip("."))
+                            out.add(clean(vv))
         for k in ("parameter", "param", "line", "handicap"):
             v = event.get(k)
             if isinstance(v, (str, int, float)):
                 out.add(str(v))
-                out.add(str(v).rstrip("0").rstrip("."))
+                out.add(clean(v))
         return out
 
     @staticmethod
@@ -135,6 +144,38 @@ class MelbetEngine:
                         return True
                 except (IndexError, ValueError):
                     pass
+        return False
+
+    # ---------- player name matching ----------
+    @staticmethod
+    def _norm_name(s):
+        s = re.sub(r"[^a-z\s]", " ", (s or "").lower())
+        return " ".join(s.split())
+
+    @classmethod
+    def name_matches(cls, player_name, subgame_name):
+        """
+        'Virat Kohli' ↔ 'V. Kohli' ধরনের পার্থক্য সামলায়।
+        মিলবে যদি:
+          1) পুরো নাম সাবগেমের নামে থাকে, অথবা
+          2) পদবির ঠিক আগের শব্দটা হয় নামের প্রথম অক্ষর (যেমন 'V Kohli') অথবা হুবহু প্রথম নাম।
+        শুধু পদবি মিললেই চলবে না, যাতে ভুল প্লেয়ারে বেট না বসে।
+        """
+        p = cls._norm_name(player_name)
+        g = cls._norm_name(subgame_name)
+        if not p:
+            return True
+        if p in g:
+            return True
+        parts = p.split()
+        if len(parts) >= 2:
+            first, last = parts[0], parts[-1]
+            toks = g.split()
+            for i, t in enumerate(toks):
+                if t == last and i > 0:
+                    prev = toks[i - 1]
+                    if prev == first or (len(prev) == 1 and prev == first[0]):
+                        return True
         return False
 
     # ---------- classification ----------
@@ -196,7 +237,7 @@ class MelbetEngine:
             subgame_name = subgame.get("subGameName", "") or ""
             kinds = self._infer_group_kind(subgame_name)
 
-            if player_name and player_name.lower() not in subgame_name.lower():
+            if player_name and not self.name_matches(player_name, subgame_name):
                 continue
 
             if bet_type == "wicket_under" and not kinds["is_wicket"]:
@@ -225,12 +266,13 @@ class MelbetEngine:
                         continue
 
                     if player_id:
+                        # strict: event must carry the same playerId
                         ev_pid = event.get("playerId", 0)
                         try:
-                            if ev_pid and int(ev_pid) != int(player_id):
+                            if not ev_pid or int(ev_pid) != int(player_id):
                                 continue
                         except (TypeError, ValueError):
-                            pass
+                            continue
 
                     if bet_type in ("over", "under", "wicket_under"):
                         if line_value is not None and not self._match_param(params_set, line_value):
@@ -284,7 +326,9 @@ class MelbetEngine:
         return seen
 
     # ---------- place bet ----------
-    async def place_bet(self, game_id, bet_type, coef, param, stake=15, player_id=0):
+    async def place_bet(self, game_id, bet_type, coef, param, stake=None, player_id=0):
+        if stake is None:
+            stake = BET_STAKE  # .env-এর BET_STAKE (default 15)
         uid = await self.get_user_id()
         if uid == 0:
             print("❌ User ID পাওয়া যায়নি! লগইন চেক করুন।")
@@ -310,6 +354,8 @@ class MelbetEngine:
         }
         """
 
+        # Retry ONLY the betGUID confirmation step. Any other response is a
+        # final failure, so the same bet is never re-sent blindly.
         for _ in range(3):
             try:
                 res = await self.page.evaluate(js_fetch, {"url": api_url, "payload": payload})
@@ -317,13 +363,18 @@ class MelbetEngine:
                 print(f"❌ Bet eval failed: {e}")
                 return False
 
-            if res.get('status') == 200 and res.get('data', {}).get('ErrorCode') == 0:
-                data = res['data']
-                if data.get('Value', {}).get('Id', 0) > 0:
-                    print(f"✅ বেট সফল! ID: {data['Value']['Id']} | Stake: {stake}")
+            data = res.get('data') if isinstance(res, dict) else None
+            data = data if isinstance(data, dict) else {}
+            if res.get('status') == 200 and data.get('ErrorCode') == 0:
+                value = data.get('Value') if isinstance(data.get('Value'), dict) else {}
+                if value.get('Id', 0) > 0:
+                    print(f"✅ বেট সফল! ID: {value['Id']} | Stake: {stake}")
                     return True
-                if data.get('Value', {}).get('betGUID'):
-                    payload['betGUID'] = data['Value']['betGUID']
+                if value.get('betGUID'):
+                    payload['betGUID'] = value['betGUID']
                     await asyncio.sleep(0.3)
-        print(f"❌ বেট ফেইল বা কনফার্ম হয়নি।")
+                    continue
+            print(f"❌ বেট ফেইল: status={res.get('status')} ErrorCode={data.get('ErrorCode')}")
+            return False
+        print("❌ বেট কনফার্ম হয়নি।")
         return False
