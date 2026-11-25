@@ -22,5 +22,24 @@ ENTITY_PUSH_URL = os.getenv(
     "ws://webhook.entitysport.com:8087/connect",
 ).rstrip("/")
 
+
+def _read_stake(default=15):
+    """BET_STAKE .env থেকে পড়ে। ভুল বা শূন্য মান হলে default (15) ব্যবহার হয়।"""
+    raw = os.getenv("BET_STAKE", "").strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        print(f"⚠️ BET_STAKE='{raw}' বোঝা যায়নি, default {default} ব্যবহার হচ্ছে।")
+        return default
+    if v <= 0:
+        print(f"⚠️ BET_STAKE অবশ্যই ০-এর বেশি হতে হবে, default {default} ব্যবহার হচ্ছে।")
+        return default
+    return int(v) if v == int(v) else v
+
+
+BET_STAKE = _read_stake()
+
 if not ENTITY_API_TOKEN:
-    print("⚠️ সতর্কতা: .env ফাইলে Entity Sports REST token পাওয়া যায়নি!")
+    print("⚠️ সতর্কতা: .env ফাইলে Entity Sports REST token পাওয়া যায়নি!")
