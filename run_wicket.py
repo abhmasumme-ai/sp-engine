@@ -19,7 +19,7 @@ async def on_request(req):
         except: pass
 
 async def async_input(prompt):
-    return await asyncio.get_event_loop().run_in_executor(None, input, prompt)
+    return await asyncio.get_running_loop().run_in_executor(None, input, prompt)
 
 async def main():
     global current_match_id
