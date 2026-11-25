@@ -5,6 +5,7 @@ import os
 import re
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -30,7 +31,40 @@ from delivery_worker import DeliveryWorker
 from batsman_worker import BatsmanWorker
 from wicket_worker import WicketWorker
 
-app = FastAPI(title="Melbet Bot Dashboard")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # startup
+    global entity_push_task
+    if not ENTITY_PUSH_TOKEN:
+        entity_push_state["status"] = "missing_token"
+    elif entity_push_task is None or entity_push_task.done():
+        entity_push_task = asyncio.create_task(entity_push_listener())
+
+    yield
+
+    # shutdown
+    if entity_push_task is not None and not entity_push_task.done():
+        entity_push_task.cancel()
+        await asyncio.gather(entity_push_task, return_exceptions=True)
+    for kind, wc in list(worker_ctxs.items()):
+        try:
+            await wc.close()
+        except Exception:
+            pass
+        worker_ctxs.pop(kind, None)
+    if ctx is not None:
+        try:
+            await ctx.close()
+        except Exception:
+            pass
+    if pw is not None:
+        try:
+            await pw.stop()
+        except Exception:
+            pass
+
+
+app = FastAPI(title="Melbet Bot Dashboard", lifespan=lifespan)
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -137,6 +171,8 @@ verified_match_url = None
 entity_push_task = None
 armed_workers: set = set()
 entity_fixture_cache: dict[str, dict] = {}
+entity_last_state: dict[str, dict] = {}   # প্রতি ম্যাচের শেষ জানা teams / score / event
+preview_entity_match_id = None            # UI-তে ফিক্সচার সিলেক্ট করলে এটা সেট হয় (শুধু দেখানোর জন্য, বেট নয়)
 entity_push_state = {
     "status": "disconnected", "messages": 0,
     "last_message_at": None, "last_error": None,
@@ -385,16 +421,15 @@ async def _dispatch_entity_ball(event: dict):
     if d_wick:
         asyncio.create_task(_run_worker("wicket", worker_wicket.on_wicket()))
     if d_bat:
-        try:
-            sid = int(event.get("striker_id") or 219547144)
-        except (TypeError, ValueError):
-            sid = 219547144
-        asyncio.create_task(_run_worker(
-            "batsman",
-            worker_batsman.on_batsman_runs(
-                striker_id=sid, striker_name=event.get("striker"), line_value="31.5",
-            ),
-        ))
+        # Entity-র striker_id Melbet-এর playerId নয় — তাই শুধু নাম দিয়ে মার্কেট খোঁজা হয়।
+        sname = str(event.get("striker") or "").strip()
+        if not sname:
+            print("⚠️ [Batsman] striker-এর নাম পাওয়া যায়নি — বেট স্কিপ")
+        else:
+            asyncio.create_task(_run_worker(
+                "batsman",
+                worker_batsman.on_batsman_runs(striker_name=sname, line_value="31.5"),
+            ))
 
 
 # ============================================================
@@ -412,23 +447,29 @@ async def _handle_entity_message(payload: dict):
         return
     mid = str(mid)
     is_active = bool(active_entity_match_id and mid == str(active_entity_match_id))
+    # is_shown = UI ভিউপোর্টে দেখানো হবে (active বা প্রিভিউ করা ম্যাচ)। বেট শুধু is_active হলে।
+    is_shown = is_active or bool(preview_entity_match_id and mid == str(preview_entity_match_id))
+    state = entity_last_state.setdefault(mid, {})
 
     if mi:
         entity_fixture_cache[mid] = _fixture_from_push(mid, mi)
-        if is_active:
-            ta = mi.get("teama") if isinstance(mi.get("teama"), dict) else {}
-            tb = mi.get("teamb") if isinstance(mi.get("teamb"), dict) else {}
-            await manager.broadcast({
-                "type": "entity_match_info", "entity_match_id": mid,
-                "teams": " vs ".join(n for n in (ta.get("name"), tb.get("name")) if n),
-            })
+        ta = mi.get("teama") if isinstance(mi.get("teama"), dict) else {}
+        tb = mi.get("teamb") if isinstance(mi.get("teamb"), dict) else {}
+        teams = " vs ".join(n for n in (ta.get("name"), tb.get("name")) if n)
+        if teams:
+            state["teams"] = teams
+            if is_shown:
+                await manager.broadcast({
+                    "type": "entity_match_info", "entity_match_id": mid, "teams": teams,
+                })
 
     be = rd.get("ball_event")
     if not be:
-        if is_active:
-            s = _extract_score(mi, li, bd)
-            if s:
-                await manager.broadcast({"type": "match_update", "score": s})
+        s = _extract_score(mi, li, bd)
+        if s:
+            state["score"] = s
+            if is_shown:
+                await manager.broadcast({"type": "match_update", "entity_match_id": mid, "score": s})
         return
 
     if isinstance(be, dict):
@@ -467,8 +508,12 @@ async def _handle_entity_message(payload: dict):
     except (TypeError, ValueError):
         event["lag_ms"] = None
 
-    if is_active:
+    if score:
+        state["score"] = score
+    state["event"] = event
+    if is_shown:
         await manager.broadcast(event)
+    if is_active:
         await _dispatch_entity_ball(event)
 
 
@@ -632,6 +677,7 @@ async def launch_browser(data: LaunchRequest):
     if not url:
         return {"status": "error", "message": "Website URL required"}
 
+    new_ctx = None
     try:
         if pw is None:
             pw = await async_playwright().start()
@@ -673,7 +719,7 @@ async def launch_browser(data: LaunchRequest):
         await page.goto(url)
         asyncio.create_task(lower_chrome_priority())
     except Exception as exc:
-        for obj, fn in ((ctx, "close"), (pw, "stop")):
+        for obj, fn in ((new_ctx, "close"), (ctx, "close"), (pw, "stop")):
             try:
                 if obj is not None:
                     await getattr(obj, fn)()
@@ -697,11 +743,11 @@ async def launch_browser(data: LaunchRequest):
 @app.post("/api/lock")
 async def do_lock(data: LockRequest):
     global locked_melbet_id, current_match_id, active_entity_match_id
+    # আইডি এখন Match URL থেকেও আসতে পারে, তাই ব্রাউজারে ধরা আইডির সাথে মেলানো হয় না।
+    # আসল যাচাই হয় Verify-তে: ব্রাউজার ওই URL-এ গিয়ে একই gameId পাচ্ছে কিনা।
     mid = (data.match_id or detected_match_id or "").strip()
     if not mid:
-        return {"status": "error", "message": "No match detected yet"}
-    if detected_match_id and mid != detected_match_id:
-        return {"status": "error", "message": f"Stale ID: {mid} != {detected_match_id}"}
+        return {"status": "error", "message": "ম্যাচ আইডি নেই — Match URL দিন বা ব্রাউজারে ম্যাচ খুলুন"}
     if locked_melbet_id != mid:
         current_match_id = None
         active_entity_match_id = None
@@ -721,6 +767,42 @@ async def do_unlock():
     await manager.broadcast({"type": "unlocked"})
     for k in ("delivery", "batsman", "wicket"):
         await manager.broadcast({"type": "mulling_status", "worker": k, "enabled": False})
+    return {"status": "success"}
+
+
+class UrlRequest(BaseModel):
+    url: str = ""
+
+
+class PreviewRequest(BaseModel):
+    entity_match_id: str = ""
+
+
+@app.post("/api/parse-match-url")
+async def parse_match_url(data: UrlRequest):
+    """Match URL থেকে Melbet ম্যাচ আইডি বের করে (Verify-এর একই লজিক)।"""
+    mid = _extract_game_id((data.url or "").strip())
+    if not mid:
+        return {"status": "error", "message": "URL থেকে ম্যাচ আইডি পাওয়া যায়নি"}
+    return {"status": "success", "match_id": mid}
+
+
+@app.post("/api/preview")
+async def set_preview(data: PreviewRequest):
+    """ফিক্সচার সিলেক্ট করলে ভিউপোর্টে ওই ম্যাচের ডেটা দেখানোর জন্য। এতে কোনো বেট হয় না।"""
+    global preview_entity_match_id
+    mid = (data.entity_match_id or "").strip()
+    preview_entity_match_id = mid or None
+    if not mid:
+        return {"status": "success"}
+    fx = entity_fixture_cache.get(mid, {})
+    st = entity_last_state.get(mid, {})
+    await manager.broadcast({
+        "type": "entity_snapshot", "entity_match_id": mid,
+        "teams": st.get("teams") or fx.get("title") or "",
+        "score": st.get("score"),
+        "event": st.get("event"),
+    })
     return {"status": "success"}
 
 
@@ -744,11 +826,16 @@ async def verify_match_url(data: VerifyRequest):
     if url_id and url_id != locked_melbet_id:
         return {"status": "error", "message": f"URL gameId ({url_id}) != locked ({locked_melbet_id})"}
 
+    # আগের পেজের আইডি মুছে নতুন পেজ থেকে ধরা আইডি দিয়ে যাচাই করা হবে
+    detected_match_id = None
     try:
         await page.goto(data.url.strip(), wait_until="domcontentloaded", timeout=30000)
     except Exception as exc:
         return {"status": "error", "message": f"Navigate failed: {exc}"}
-    await asyncio.sleep(1.0)
+    for _ in range(16):  # সর্বোচ্চ ~৮ সেকেন্ড অপেক্ষা
+        if detected_match_id:
+            break
+        await asyncio.sleep(0.5)
 
     if detected_match_id and detected_match_id != locked_melbet_id:
         return {"status": "error", "message": f"Detected ({detected_match_id}) != locked ({locked_melbet_id})"}
@@ -887,6 +974,15 @@ async def reset_browser():
     return {"status": "success", "message": "Browser state reset"}
 
 
+@app.post("/api/stop-all")
+async def stop_all():
+    """Disarm every worker immediately (used by the UI Stop button)."""
+    armed_workers.clear()
+    for k in ("delivery", "batsman", "wicket"):
+        await manager.broadcast({"type": "mulling_status", "worker": k, "enabled": False})
+    return {"status": "success", "message": "All workers stopped"}
+
+
 @app.get("/api/status")
 async def get_status():
     return {
@@ -986,12 +1082,19 @@ async def bet_delivery():
     asyncio.create_task(worker_delivery.on_dot_ball(over_num=3, ball_num=5))
     return {"status": "success", "message": "Delivery bet fired"}
 
+class BatsmanBetRequest(BaseModel):
+    striker_name: str = ""
+
+
 @app.post("/api/bet/batsman")
-async def bet_batsman():
+async def bet_batsman(data: BatsmanBetRequest):
     if not current_match_id or not worker_batsman:
         return {"status": "error", "message": "Worker not ready"}
-    asyncio.create_task(worker_batsman.on_batsman_runs(striker_id=219547144, line_value="31.5"))
-    return {"status": "success", "message": "Batsman bet fired"}
+    name = (data.striker_name or "").strip()
+    if not name:
+        return {"status": "error", "message": "striker_name required"}
+    asyncio.create_task(worker_batsman.on_batsman_runs(striker_name=name, line_value="31.5"))
+    return {"status": "success", "message": f"Batsman bet fired for {name}"}
 
 @app.post("/api/bet/wicket")
 async def bet_wicket():
@@ -1047,38 +1150,8 @@ async def favicon():
 # ============================================================
 #  Lifecycle
 # ============================================================
-@app.on_event("startup")
-async def startup():
-    global entity_push_task
-    if not ENTITY_PUSH_TOKEN:
-        entity_push_state["status"] = "missing_token"
-        return
-    if entity_push_task is None or entity_push_task.done():
-        entity_push_task = asyncio.create_task(entity_push_listener())
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    if entity_push_task is not None and not entity_push_task.done():
-        entity_push_task.cancel()
-        await asyncio.gather(entity_push_task, return_exceptions=True)
-    for kind, wc in list(worker_ctxs.items()):
-        try:
-            await wc.close()
-        except Exception:
-            pass
-        worker_ctxs.pop(kind, None)
-    if ctx is not None:
-        try:
-            await ctx.close()
-        except Exception:
-            pass
-    if pw is not None:
-        try:
-            await pw.stop()
-        except Exception:
-            pass
-
+# (startup/shutdown handled by `lifespan` defined near the top of this file)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    # 127.0.0.1 = only this PC can reach the dashboard / bet endpoints
+    uvicorn.run(app, host="127.0.0.1", port=5000)
