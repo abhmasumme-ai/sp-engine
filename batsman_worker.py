@@ -46,6 +46,7 @@ class BatsmanWorker:
             market['game_id'], market['type'],
             market['coef'], market['param'],
             player_id=market.get('player_id', 0),
+            match_id=self.match_id,
         )
         print(f"{'✅' if ok else '❌'} [Batsman] বেট ফলাফল: {'সফল' if ok else 'ব্যর্থ'}")
         return ok
