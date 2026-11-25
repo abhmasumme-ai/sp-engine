@@ -1,4 +1,4 @@
-import re
+from event_utils import classify_entity_event
 
 
 class DeliveryWorker:
@@ -11,23 +11,20 @@ class DeliveryWorker:
         return await self.process_ball(over_num, ball_num, "0")
 
     async def process_ball(self, over, ball, ev, event_kind=None):
-        """Full event handler (used by api_server & on_dot_ball)."""
+        """Full event handler (used by api_server & on_dot_ball).
+
+        NOTE: `ball` এখন শুধু লগে ব্যবহার হয়; মার্কেট খোঁজা হয় ওভার নম্বর দিয়ে।
+        """
         print(f"\n🏏 [Delivery Worker] Entity: {over}.{ball} - {ev}")
         game_events = await self.engine.get_latest_odds(self.match_id)
         if not game_events:
             print("⚠️ [Delivery] ওডস পাওয়া যায়নি।")
             return False
 
-        ev_str = str(ev).strip().lower()
-        is_wicket = event_kind == "wicket" or bool(re.match(
-            r"^(wicket|out|w)(?:[.!]|\s|$)|^(bowled|lbw|caught|c\s*&\s*b|"
-            r"run\s*out|stumped?|hit\s*wicket|retired|handled|obstruct)",
-            ev_str,
-        ))
-        is_dot = event_kind == "dot" or ev_str in ("0", "dot", "no run", "norun")
-        is_four = event_kind == "four" or bool(
-            re.match(r"^(?:4|four)(?:\b|$)", ev_str)
-        )
+        kind = event_kind or classify_entity_event(ev)
+        is_wicket = kind == "wicket"
+        is_dot = kind == "dot"
+        is_four = kind == "four"
 
         # Logic 1: Dot / Wicket → 0.5 Under on current over
         if is_dot or is_wicket:
@@ -39,7 +36,8 @@ class DeliveryWorker:
                 return False
             print(f"🎯 [Delivery] Dot/Wicket! Over {over} 0.5 Under বেট হচ্ছে...")
             ok = await self.engine.place_bet(
-                market['game_id'], market['type'], market['coef'], market['param']
+                market['game_id'], market['type'], market['coef'], market['param'],
+                match_id=self.match_id,
             )
             print(f"{'✅' if ok else '❌'} [Delivery] বেট ফলাফল: {'সফল' if ok else 'ব্যর্থ'}")
             return ok
@@ -55,7 +53,8 @@ class DeliveryWorker:
                 return False
             print(f"🎯 [Delivery] 4 Runs! Over {target_over} 3.5 Over বেট হচ্ছে...")
             ok = await self.engine.place_bet(
-                market['game_id'], market['type'], market['coef'], market['param']
+                market['game_id'], market['type'], market['coef'], market['param'],
+                match_id=self.match_id,
             )
             print(f"{'✅' if ok else '❌'} [Delivery] বেট ফলাফল: {'সফল' if ok else 'ব্যর্থ'}")
             return ok
