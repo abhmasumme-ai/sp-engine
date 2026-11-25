@@ -396,8 +396,9 @@ window.addEventListener("DOMContentLoaded", () => {
   $("submitSiteBtn").addEventListener("click", launchMain);
   $("bLaunch").addEventListener("click", launchMain);
 
-  $("bStop").addEventListener("click", () => {
-    log("# Stop requested — reloading.");
+  $("bStop").addEventListener("click", async () => {
+    log("# Stop requested — disarming all workers…");
+    await postJson("/api/stop-all", {});
     location.reload();
   });
 
