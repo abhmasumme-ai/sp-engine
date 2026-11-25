@@ -19,13 +19,16 @@ from patchright.async_api import async_playwright
 import uvicorn
 import websockets
 
+from bet_guard import guard
 from config import (
     ENTITY_API_TOKEN,
-    ENTITY_MATCH_ID,
     ENTITY_PUSH_TOKEN,
     ENTITY_PUSH_URL,
     ENTITY_REST_BASE,
+    OVER_ZERO_IS_LAST_BALL,
+    profile_dir,
 )
+from event_utils import classify_entity_event
 from melbet_engine import MelbetEngine
 from delivery_worker import DeliveryWorker
 from batsman_worker import BatsmanWorker
@@ -39,6 +42,11 @@ async def lifespan(_app: FastAPI):
         entity_push_state["status"] = "missing_token"
     elif entity_push_task is None or entity_push_task.done():
         entity_push_task = asyncio.create_task(entity_push_listener())
+
+    # Background: warm up fixture cache so `teams` can be resolved even if
+    # Entity push arrives without match_info
+    if ENTITY_API_TOKEN and ENTITY_REST_BASE:
+        _spawn(_prefetch_fixtures())
 
     yield
 
@@ -125,6 +133,19 @@ async def is_logged_in(target_page) -> bool:
 
 
 # ============================================================
+#  Background task helper
+# ============================================================
+_bg_tasks: set = set()
+
+
+def _spawn(coro):
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
+# ============================================================
 #  Connection manager
 # ============================================================
 class ConnectionManager:
@@ -171,8 +192,11 @@ verified_match_url = None
 entity_push_task = None
 armed_workers: set = set()
 entity_fixture_cache: dict[str, dict] = {}
-entity_last_state: dict[str, dict] = {}   # প্রতি ম্যাচের শেষ জানা teams / score / event
-preview_entity_match_id = None            # UI-তে ফিক্সচার সিলেক্ট করলে এটা সেট হয় (শুধু দেখানোর জন্য, বেট নয়)
+entity_last_state: dict[str, dict] = {}
+preview_entity_match_id = None
+_last_seen_entity_mid = None   # UI-তে শেষ যেই match এর data broadcast হয়েছে
+_entity_debug_log = deque(maxlen=20)
+
 entity_push_state = {
     "status": "disconnected", "messages": 0,
     "last_message_at": None, "last_error": None,
@@ -189,6 +213,7 @@ def _reset_main_state():
     global ctx, page, engine
     global detected_match_id, locked_melbet_id
     global current_match_id, active_entity_match_id, verified_match_url
+    global preview_entity_match_id, _last_seen_entity_mid
     global worker_delivery, worker_batsman, worker_wicket
 
     ctx = None
@@ -199,6 +224,8 @@ def _reset_main_state():
     current_match_id = None
     active_entity_match_id = None
     verified_match_url = None
+    preview_entity_match_id = None
+    _last_seen_entity_mid = None
     worker_delivery = worker_batsman = worker_wicket = None
     armed_workers.clear()
 
@@ -239,7 +266,7 @@ def _bind_main_close_handlers():
             await manager.broadcast({"type": "mulling_status", "worker": k, "enabled": False})
 
     try:
-        ctx.on("close", lambda *_: asyncio.create_task(_on_close()))
+        ctx.on("close", lambda *_: _spawn(_on_close()))
     except Exception as e:
         print(f"[close-hook] main: {e}")
 
@@ -255,7 +282,7 @@ def _bind_worker_close_handlers(kind: str, wctx):
         await manager.broadcast({"type": "mulling_status", "worker": kind, "enabled": False})
 
     try:
-        wctx.on("close", lambda *_: asyncio.create_task(_on_close()))
+        wctx.on("close", lambda *_: _spawn(_on_close()))
     except Exception as e:
         print(f"[close-hook] {kind}: {e}")
 
@@ -290,27 +317,10 @@ def _event_position(data: dict):
                 break
         except (TypeError, ValueError):
             continue
+    if OVER_ZERO_IS_LAST_BALL and ball_number == 0 and over_number:
+        over_number -= 1
+        ball_number = 6
     return over_number, ball_number, px
-
-
-def _classify_entity_event(event_text: str) -> str:
-    ev = str(event_text or "").strip().lower()
-    if re.match(
-        r"^(wicket|out|w)(?:[.!]|\s|$)|^(bowled|lbw|caught|c\s*&\s*b|"
-        r"run\s*out|stumped?|hit\s*wicket|retired|handled|obstruct)", ev,
-    ):
-        return "wicket"
-    if re.match(r"^(no[\s_-]?ball|nb|wide|wd)\b", ev):
-        return "other"
-    if re.match(r"^(dot|0)\b", ev) or re.match(r"^no[\s_-]?run\b", ev):
-        return "dot"
-    if re.match(r"^(four|4)\b", ev):
-        return "four"
-    if re.match(r"^(six|6)\b", ev):
-        return "six"
-    if re.match(r"^\d+\b", ev):
-        return "run"
-    return "intermediate"
 
 
 def _remember_event(mid: str, eid: str) -> bool:
@@ -384,6 +394,30 @@ def _extract_score(mi: dict, li: dict, bd: dict):
     return f"{runs} - {wickets or 0}"
 
 
+def _guard_payload() -> dict:
+    return {"type": "guard_status", **guard.status()}
+
+
+async def _prefetch_fixtures():
+    """Startup-এ live+upcoming fixture cache ভরে দেয়, যাতে match_info ছাড়া push এলেও teams দেখানো যায়।"""
+    try:
+        groups = await asyncio.gather(
+            *(asyncio.to_thread(fetch_entity_fixtures, s) for s in ("3", "1")),
+            return_exceptions=True,
+        )
+        count = 0
+        for g in groups:
+            if isinstance(g, Exception):
+                print(f"[prefetch] {g}")
+                continue
+            for f in g:
+                entity_fixture_cache[f["match_id"]] = f
+                count += 1
+        print(f"[prefetch] cached {count} fixtures")
+    except Exception as e:
+        print(f"[prefetch] failed: {e}")
+
+
 # ============================================================
 #  Worker dispatch
 # ============================================================
@@ -413,20 +447,23 @@ async def _dispatch_entity_ball(event: dict):
         return
     if not _remember_event(event["entity_match_id"], event["event_id"]):
         return
+
+    print(f"[dispatch] {kind} raw(over={event.get('raw_over')}, ball={event.get('raw_ball')}, "
+          f"xball={event.get('xball')}) -> over_number={on}, ball_number={bn}")
+
     if d_del:
-        asyncio.create_task(_run_worker(
+        _spawn(_run_worker(
             "delivery",
             worker_delivery.process_ball(on, bn, event["event"], event_kind=kind),
         ))
     if d_wick:
-        asyncio.create_task(_run_worker("wicket", worker_wicket.on_wicket()))
+        _spawn(_run_worker("wicket", worker_wicket.on_wicket()))
     if d_bat:
-        # Entity-র striker_id Melbet-এর playerId নয় — তাই শুধু নাম দিয়ে মার্কেট খোঁজা হয়।
         sname = str(event.get("striker") or "").strip()
         if not sname:
             print("⚠️ [Batsman] striker-এর নাম পাওয়া যায়নি — বেট স্কিপ")
         else:
-            asyncio.create_task(_run_worker(
+            _spawn(_run_worker(
                 "batsman",
                 worker_batsman.on_batsman_runs(striker_name=sname, line_value="31.5"),
             ))
@@ -436,6 +473,7 @@ async def _dispatch_entity_ball(event: dict):
 #  Entity message handler
 # ============================================================
 async def _handle_entity_message(payload: dict):
+    global _last_seen_entity_mid
     rd = payload.get("response")
     if not isinstance(rd, dict):
         return
@@ -446,23 +484,58 @@ async def _handle_entity_message(payload: dict):
     if not mid:
         return
     mid = str(mid)
-    is_active = bool(active_entity_match_id and mid == str(active_entity_match_id))
-    # is_shown = UI ভিউপোর্টে দেখানো হবে (active বা প্রিভিউ করা ম্যাচ)। বেট শুধু is_active হলে।
-    is_shown = is_active or bool(preview_entity_match_id and mid == str(preview_entity_match_id))
-    state = entity_last_state.setdefault(mid, {})
 
+    _entity_debug_log.append({
+        "ts": round(time.time(), 3), "mid": mid, "keys": list(rd.keys()),
+        "has_mi": bool(mi), "has_bd": bool(bd),
+    })
+
+    is_new = mid not in entity_last_state
+    state = entity_last_state.setdefault(mid, {})
+    if is_new:
+        print(f"[entity] New match seen: mid={mid} keys={list(rd.keys())} has_mi={bool(mi)}")
+
+    # -------- Focus / show decision --------
+    # Priority: preview (user click) > active (verified) > last-seen (first push ever)
+    if preview_entity_match_id:
+        is_shown = (mid == str(preview_entity_match_id))
+    elif active_entity_match_id:
+        is_shown = (mid == str(active_entity_match_id))
+    elif _last_seen_entity_mid is None:
+        is_shown = True
+    else:
+        is_shown = (mid == _last_seen_entity_mid)
+
+    is_active = bool(active_entity_match_id and mid == str(active_entity_match_id))
+
+    if is_shown:
+        _last_seen_entity_mid = mid
+
+    # -------- Teams (match_info > fixture cache) --------
+    teams_changed = False
     if mi:
-        entity_fixture_cache[mid] = _fixture_from_push(mid, mi)
         ta = mi.get("teama") if isinstance(mi.get("teama"), dict) else {}
         tb = mi.get("teamb") if isinstance(mi.get("teamb"), dict) else {}
-        teams = " vs ".join(n for n in (ta.get("name"), tb.get("name")) if n)
-        if teams:
-            state["teams"] = teams
-            if is_shown:
-                await manager.broadcast({
-                    "type": "entity_match_info", "entity_match_id": mid, "teams": teams,
-                })
+        # Only cache when real info present (avoid "Unknown match" overwriting good cache)
+        if ta.get("name") or tb.get("name") or mi.get("title") or mi.get("short_title"):
+            entity_fixture_cache[mid] = _fixture_from_push(mid, mi)
+            teams = " vs ".join(n for n in (ta.get("name"), tb.get("name")) if n) or mi.get("title") or ""
+            if teams and teams != state.get("teams"):
+                state["teams"] = teams
+                teams_changed = True
 
+    if not state.get("teams"):
+        fx = entity_fixture_cache.get(mid, {})
+        if fx.get("title") and fx["title"] != "Unknown match":
+            state["teams"] = fx["title"]
+            teams_changed = True
+
+    if is_shown and state.get("teams") and teams_changed:
+        await manager.broadcast({
+            "type": "entity_match_info", "entity_match_id": mid, "teams": state["teams"],
+        })
+
+    # -------- Score (when no ball_event) --------
     be = rd.get("ball_event")
     if not be:
         s = _extract_score(mi, li, bd)
@@ -472,6 +545,7 @@ async def _handle_entity_message(payload: dict):
                 await manager.broadcast({"type": "match_update", "entity_match_id": mid, "score": s})
         return
 
+    # -------- Ball event --------
     if isinstance(be, dict):
         et = str(be.get("ev") or be.get("event") or "")
         if not bd:
@@ -491,12 +565,14 @@ async def _handle_entity_message(payload: dict):
     score = _extract_score(mi, li, bd)
     event = {
         "type": "entity_ball_event", "entity_match_id": mid, "event_id": eid,
-        "event": et, "kind": _classify_entity_event(et),
+        "event": et, "kind": classify_entity_event(et),
         "over": bd.get("over"), "over_number": on, "ball_number": bn, "xball": xb,
+        "raw_over": bd.get("over"), "raw_ball": bd.get("ball"),
         "innings": bd.get("inn") or bd.get("inn_num"),
         "striker": bd.get("striker"),
         "striker_id": bd.get("striker_id") or bd.get("player_id"),
         "bowler": bd.get("bowler"), "score": score,
+        "teams": state.get("teams"),
     }
     ts = payload.get("timestamp")
     try:
@@ -627,6 +703,7 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         await websocket.send_json({"type": "entity_push_status", **entity_push_state})
+        await websocket.send_json(_guard_payload())
         await websocket.send_json({
             "type": "browser_status",
             "main": await _main_alive(),
@@ -683,7 +760,7 @@ async def launch_browser(data: LaunchRequest):
             pw = await async_playwright().start()
 
         new_ctx = await pw.chromium.launch_persistent_context(
-            user_data_dir="./profile_main",
+            user_data_dir=profile_dir("main"),
             headless=False, channel="chrome", no_viewport=True,
             args=browser_args("0,0", "1100,720"),
         )
@@ -715,9 +792,9 @@ async def launch_browser(data: LaunchRequest):
             except Exception as exc:
                 print(f"⚠️ Match URL ধরতে ব্যর্থ: {exc}")
 
-        page.on("request", lambda r: asyncio.create_task(on_request(r)))
+        page.on("request", lambda r: _spawn(on_request(r)))
         await page.goto(url)
-        asyncio.create_task(lower_chrome_priority())
+        _spawn(lower_chrome_priority())
     except Exception as exc:
         for obj, fn in ((new_ctx, "close"), (ctx, "close"), (pw, "stop")):
             try:
@@ -743,8 +820,6 @@ async def launch_browser(data: LaunchRequest):
 @app.post("/api/lock")
 async def do_lock(data: LockRequest):
     global locked_melbet_id, current_match_id, active_entity_match_id
-    # আইডি এখন Match URL থেকেও আসতে পারে, তাই ব্রাউজারে ধরা আইডির সাথে মেলানো হয় না।
-    # আসল যাচাই হয় Verify-তে: ব্রাউজার ওই URL-এ গিয়ে একই gameId পাচ্ছে কিনা।
     mid = (data.match_id or detected_match_id or "").strip()
     if not mid:
         return {"status": "error", "message": "ম্যাচ আইডি নেই — Match URL দিন বা ব্রাউজারে ম্যাচ খুলুন"}
@@ -759,10 +834,13 @@ async def do_lock(data: LockRequest):
 @app.post("/api/unlock")
 async def do_unlock():
     global locked_melbet_id, current_match_id, active_entity_match_id, verified_match_url
+    global preview_entity_match_id, _last_seen_entity_mid
     locked_melbet_id = None
     current_match_id = None
     active_entity_match_id = None
     verified_match_url = None
+    preview_entity_match_id = None
+    _last_seen_entity_mid = None
     armed_workers.clear()
     await manager.broadcast({"type": "unlocked"})
     for k in ("delivery", "batsman", "wicket"):
@@ -809,6 +887,7 @@ async def set_preview(data: PreviewRequest):
 @app.post("/api/verify-match-url")
 async def verify_match_url(data: VerifyRequest):
     global current_match_id, active_entity_match_id, detected_match_id, verified_match_url
+    global preview_entity_match_id
 
     if ctx is None or not await _main_alive():
         _reset_main_state()
@@ -826,13 +905,12 @@ async def verify_match_url(data: VerifyRequest):
     if url_id and url_id != locked_melbet_id:
         return {"status": "error", "message": f"URL gameId ({url_id}) != locked ({locked_melbet_id})"}
 
-    # আগের পেজের আইডি মুছে নতুন পেজ থেকে ধরা আইডি দিয়ে যাচাই করা হবে
     detected_match_id = None
     try:
         await page.goto(data.url.strip(), wait_until="domcontentloaded", timeout=30000)
     except Exception as exc:
         return {"status": "error", "message": f"Navigate failed: {exc}"}
-    for _ in range(16):  # সর্বোচ্চ ~৮ সেকেন্ড অপেক্ষা
+    for _ in range(16):
         if detected_match_id:
             break
         await asyncio.sleep(0.5)
@@ -842,6 +920,7 @@ async def verify_match_url(data: VerifyRequest):
 
     current_match_id = locked_melbet_id
     active_entity_match_id = data.entity_match_id
+    preview_entity_match_id = None   # preview reset — focus goes back to active
     verified_match_url = data.url.strip()
 
     fixture = entity_fixture_cache.get(active_entity_match_id, {})
@@ -901,11 +980,11 @@ async def launch_worker(kind: str, data: LaunchRequest):
 
     try:
         wctx = await pw.chromium.launch_persistent_context(
-            user_data_dir=f"./profile_{kind}",
+            user_data_dir=profile_dir(kind),
             headless=want_headless, channel="chrome", no_viewport=True,
             args=browser_args(pos, "1000,680"),
         )
-        asyncio.create_task(lower_chrome_priority())
+        _spawn(lower_chrome_priority())
         wpage = wctx.pages[0] if wctx.pages else await wctx.new_page()
         await wpage.goto(url)
 
@@ -918,11 +997,11 @@ async def launch_worker(kind: str, data: LaunchRequest):
                 except Exception:
                     pass
                 wctx = await pw.chromium.launch_persistent_context(
-                    user_data_dir=f"./profile_{kind}",
+                    user_data_dir=profile_dir(kind),
                     headless=False, channel="chrome", no_viewport=True,
                     args=browser_args(pos, "1000,680"),
                 )
-                asyncio.create_task(lower_chrome_priority())
+                _spawn(lower_chrome_priority())
                 wpage = wctx.pages[0] if wctx.pages else await wctx.new_page()
                 await wpage.goto(url)
 
@@ -991,8 +1070,56 @@ async def get_status():
         "wicket": bool(worker_ctxs.get("wicket")),
         "locked_melbet_id": locked_melbet_id,
         "active_entity_match_id": active_entity_match_id,
+        "preview_entity_match_id": preview_entity_match_id,
+        "last_seen_entity_mid": _last_seen_entity_mid,
         "armed_workers": sorted(armed_workers),
+        "kill_switch": guard.killed,
+        "entity_push": dict(entity_push_state),
     }
+
+
+# ============================================================
+#  Debug (useful when UI shows nothing)
+# ============================================================
+@app.get("/api/debug/entity")
+async def debug_entity():
+    return {
+        "status": "success",
+        "push": dict(entity_push_state),
+        "active_entity_match_id": active_entity_match_id,
+        "preview_entity_match_id": preview_entity_match_id,
+        "last_seen_entity_mid": _last_seen_entity_mid,
+        "known_matches": list(entity_last_state.keys()),
+        "cached_fixtures": {k: v.get("title") for k, v in entity_fixture_cache.items()},
+        "recent_messages": list(_entity_debug_log),
+    }
+
+
+# ============================================================
+#  Bet guard (kill-switch + limits)
+# ============================================================
+@app.get("/api/guard")
+async def get_guard():
+    return {"status": "success", **guard.status()}
+
+
+@app.post("/api/guard/kill")
+async def guard_kill():
+    """Kill-switch ON: নতুন কোনো বেট যাবে না এবং সব worker disarm হবে।"""
+    guard.kill()
+    armed_workers.clear()
+    await manager.broadcast(_guard_payload())
+    for k in ("delivery", "batsman", "wicket"):
+        await manager.broadcast({"type": "mulling_status", "worker": k, "enabled": False})
+    return {"status": "success", "message": "Kill-switch ON — সব বেট বন্ধ"}
+
+
+@app.post("/api/guard/resume")
+async def guard_resume():
+    """Kill-switch OFF। Worker আবার Mulling দিয়ে চালু করতে হবে।"""
+    guard.resume()
+    await manager.broadcast(_guard_payload())
+    return {"status": "success", "message": "Kill-switch OFF — আবার Mulling চালু করুন"}
 
 
 # ============================================================
@@ -1037,6 +1164,8 @@ async def set_mulling(worker_kind: str, data: MullingRequest):
         return {"status": "error", "message": "Verify a match first!"}
     if not active_entity_match_id:
         return {"status": "error", "message": "No entity match active"}
+    if data.enabled and guard.killed:
+        return {"status": "error", "message": "Kill-switch ON — আগে Resume করুন"}
 
     if data.enabled:
         if worker_kind == "delivery":
@@ -1079,7 +1208,7 @@ async def set_mulling(worker_kind: str, data: MullingRequest):
 async def bet_delivery():
     if not current_match_id or not worker_delivery:
         return {"status": "error", "message": "Worker not ready"}
-    asyncio.create_task(worker_delivery.on_dot_ball(over_num=3, ball_num=5))
+    _spawn(worker_delivery.on_dot_ball(over_num=3, ball_num=5))
     return {"status": "success", "message": "Delivery bet fired"}
 
 class BatsmanBetRequest(BaseModel):
@@ -1093,14 +1222,14 @@ async def bet_batsman(data: BatsmanBetRequest):
     name = (data.striker_name or "").strip()
     if not name:
         return {"status": "error", "message": "striker_name required"}
-    asyncio.create_task(worker_batsman.on_batsman_runs(striker_name=name, line_value="31.5"))
+    _spawn(worker_batsman.on_batsman_runs(striker_name=name, line_value="31.5"))
     return {"status": "success", "message": f"Batsman bet fired for {name}"}
 
 @app.post("/api/bet/wicket")
 async def bet_wicket():
     if not current_match_id or not worker_wicket:
         return {"status": "error", "message": "Worker not ready"}
-    asyncio.create_task(worker_wicket.on_wicket(line_value="1.5"))
+    _spawn(worker_wicket.on_wicket(line_value="1.5"))
     return {"status": "success", "message": "Wicket bet fired"}
 
 
@@ -1150,8 +1279,5 @@ async def favicon():
 # ============================================================
 #  Lifecycle
 # ============================================================
-# (startup/shutdown handled by `lifespan` defined near the top of this file)
-
 if __name__ == "__main__":
-    # 127.0.0.1 = only this PC can reach the dashboard / bet endpoints
     uvicorn.run(app, host="127.0.0.1", port=5000)
