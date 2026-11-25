@@ -25,7 +25,8 @@ class WicketWorker:
         print(f"🎯 [Wicket] Fall in Wicket {line_value} Under বেট হচ্ছে...")
         ok = await self.engine.place_bet(
             market['game_id'], market['type'],
-            market['coef'], market['param']
+            market['coef'], market['param'],
+            match_id=self.match_id,
         )
         print(f"{'✅' if ok else '❌'} [Wicket] বেট ফলাফল: {'সফল' if ok else 'ব্যর্থ'}")
         return ok
