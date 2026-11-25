@@ -1,6 +1,7 @@
 import asyncio
 import re
 
+from bet_guard import guard
 from config import BET_STAKE
 
 
@@ -326,12 +327,20 @@ class MelbetEngine:
         return seen
 
     # ---------- place bet ----------
-    async def place_bet(self, game_id, bet_type, coef, param, stake=None, player_id=0):
+    async def place_bet(self, game_id, bet_type, coef, param, stake=None,
+                        player_id=0, match_id=None):
+        """match_id: bet_guard-এর ম্যাচ-প্রতি সীমা গোনার জন্য (workers পাঠায়)।"""
         if stake is None:
             stake = BET_STAKE  # .env-এর BET_STAKE (default 15)
         uid = await self.get_user_id()
         if uid == 0:
             print("❌ User ID পাওয়া যায়নি! লগইন চেক করুন।")
+            return False
+
+        # সীমা / kill-switch / odds যাচাই — await-এর আগেই কোটা কাটা হয়
+        ok, reason = guard.reserve(match_id, stake, coef)
+        if not ok:
+            print(f"🛑 বেট আটকানো হয়েছে: {reason}")
             return False
 
         api_url = "/service-api/LiveBet/Secure/MakeBetWeb"
@@ -354,27 +363,37 @@ class MelbetEngine:
         }
         """
 
-        # Retry ONLY the betGUID confirmation step. Any other response is a
-        # final failure, so the same bet is never re-sent blindly.
-        for _ in range(3):
-            try:
-                res = await self.page.evaluate(js_fetch, {"url": api_url, "payload": payload})
-            except Exception as e:
-                print(f"❌ Bet eval failed: {e}")
-                return False
+        # "failed" = সার্ভার স্পষ্ট বলেছে বেট হয়নি → কোটা ফেরত।
+        # অনিশ্চিত অবস্থায় (exception / কনফার্ম হয়নি) কোটা ধরে রাখা হয়,
+        # কারণ বেট আসলে চলে গিয়ে থাকতে পারে।
+        outcome = "unknown"
+        try:
+            # Retry ONLY the betGUID confirmation step. Any other response is a
+            # final failure, so the same bet is never re-sent blindly.
+            for _ in range(3):
+                try:
+                    res = await self.page.evaluate(js_fetch, {"url": api_url, "payload": payload})
+                except Exception as e:
+                    print(f"❌ Bet eval failed: {e}")
+                    return False
 
-            data = res.get('data') if isinstance(res, dict) else None
-            data = data if isinstance(data, dict) else {}
-            if res.get('status') == 200 and data.get('ErrorCode') == 0:
-                value = data.get('Value') if isinstance(data.get('Value'), dict) else {}
-                if value.get('Id', 0) > 0:
-                    print(f"✅ বেট সফল! ID: {value['Id']} | Stake: {stake}")
-                    return True
-                if value.get('betGUID'):
-                    payload['betGUID'] = value['betGUID']
-                    await asyncio.sleep(0.3)
-                    continue
-            print(f"❌ বেট ফেইল: status={res.get('status')} ErrorCode={data.get('ErrorCode')}")
+                res = res if isinstance(res, dict) else {}
+                data = res.get("data") if isinstance(res.get("data"), dict) else {}
+                if res.get("status") == 200 and data.get("ErrorCode") == 0:
+                    value = data.get("Value") if isinstance(data.get("Value"), dict) else {}
+                    if (value.get("Id") or 0) > 0:
+                        outcome = "ok"
+                        print(f"✅ বেট সফল! ID: {value['Id']} | Stake: {stake}")
+                        return True
+                    if value.get("betGUID"):
+                        payload["betGUID"] = value["betGUID"]
+                        await asyncio.sleep(0.3)
+                        continue
+                outcome = "failed"
+                print(f"❌ বেট ফেইল: status={res.get('status')} ErrorCode={data.get('ErrorCode')}")
+                return False
+            print("❌ বেট কনফার্ম হয়নি।")
             return False
-        print("❌ বেট কনফার্ম হয়নি।")
-        return False
+        finally:
+            if outcome == "failed":
+                guard.release(match_id, stake)
