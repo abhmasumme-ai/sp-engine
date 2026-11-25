@@ -15,6 +15,7 @@ const S = {
   lockedMelbetId: null,
   isLocked: false,
   isVerified: false,
+  guardKilled: false,
   mulling: { delivery: false, batsman: false, wicket: false },
   workerLaunched: { delivery: false, batsman: false, wicket: false },
   currentOver: null,
@@ -135,6 +136,18 @@ function setEntityStatus(state, msgs) {
   }
 }
 
+/* ---------- Kill-switch (guard) UI ---------- */
+function setGuard(killed) {
+  S.guardKilled = !!killed;
+  const b = $("bKill");
+  if (!b) return;
+  b.style.background = killed ? "var(--red)" : "";
+  b.style.borderColor = killed ? "var(--red)" : "";
+  b.style.color = killed ? "#fff" : "";
+  b.title = killed ? "Kill-switch ON — click to resume" : "Kill-switch: stop all bets";
+  b.innerHTML = killed ? '<i class="fa-solid fa-play"></i>' : '<i class="fa-solid fa-ban"></i>';
+}
+
 /* ---------- Lock / verified UI ---------- */
 function setLock(isOn) {
   S.isLocked = isOn;
@@ -178,6 +191,7 @@ function resetUiState(msg) {
   if ($("score")) $("score").textContent = "0 - 0";
   if ($("overTxt")) $("overTxt").textContent = "0.0 OVER";
   if ($("overNo")) $("overNo").textContent = "-- OVER";
+  S.currentOver = null;
   S.overDots = [];
   renderOverDots();
   setBall("idle", "-");
@@ -189,13 +203,15 @@ function resetUiState(msg) {
 }
 
 /* ---------- Ball event from entity ---------- */
-function handleEntityBallEvent(m) {
+function handleEntityBallEvent(m, isSnapshot = false) {
   const p = classifyEventText(m.event);
   setBall(p.kind, p.label);
-  $("status").textContent = "Entity Push • Live";
-  const now = Date.now();
-  if (S.lastEventAt) updateClickBar(Math.min(300, now - S.lastEventAt));
-  S.lastEventAt = now;
+  $("status").textContent = isSnapshot ? "Preview • last known" : "Entity Push • Live";
+  if (!isSnapshot) {
+    const now = Date.now();
+    if (S.lastEventAt) updateClickBar(Math.min(300, now - S.lastEventAt));
+    S.lastEventAt = now;
+  }
   if (m.over_number != null) {
     $("overTxt").textContent = `${m.over_number}.${m.ball_number || 0} OVER`;
     $("overNo").textContent = `OVER ${m.over_number}`;
@@ -204,7 +220,29 @@ function handleEntityBallEvent(m) {
   if (m.teams) $("matchTeams").textContent = m.teams;
   updateOverDots(m.over_number, m.ball_number, p.kind);
   if (m.lag_ms != null) updateOddsBar(m.lag_ms);
-  log(`[Ball] ${m.over_number ?? "?"}.${m.ball_number ?? "?"} ${m.event || "-"} ${m.lag_ms != null ? `(lag=${m.lag_ms}ms)` : ""}`);
+  if (!isSnapshot) {
+    log(`[Ball] ${m.over_number ?? "?"}.${m.ball_number ?? "?"} ${m.event || "-"} ${m.lag_ms != null ? `(lag=${m.lag_ms}ms)` : ""}`);
+  }
+}
+
+/* ফিক্সচার প্রিভিউ করলে ভিউপোর্ট রিসেট করে ওই ম্যাচের শেষ জানা অবস্থা দেখায় (বেট হয় না) */
+function applySnapshot(m) {
+  S.currentOver = null;
+  S.overDots = [];
+  renderOverDots();
+  setBall("idle", "-");
+  $("status").textContent = "Preview • waiting for data...";
+  $("matchTeams").textContent = m.teams || "-- vs --";
+  $("score").textContent = m.score || "0 - 0";
+  $("overTxt").textContent = "0.0 OVER";
+  $("overNo").textContent = "-- OVER";
+  if (m.event) {
+    handleEntityBallEvent({
+      ...m.event,
+      teams: m.teams || m.event.teams,
+      score: m.score || m.event.score,
+    }, true);
+  }
 }
 
 function setMulling(kind, on) {
@@ -227,6 +265,10 @@ function startLiveListener() {
     switch (m.type) {
       case "entity_push_status":
         setEntityStatus(m.status, m.messages);
+        break;
+
+      case "guard_status":
+        setGuard(m.killed);
         break;
 
       case "browser_status":
@@ -290,6 +332,10 @@ function startLiveListener() {
 
       case "entity_match_info":
         if (m.teams) $("matchTeams").textContent = m.teams;
+        break;
+
+      case "entity_snapshot":
+        applySnapshot(m);
         break;
 
       case "entity_ball_event":
@@ -364,6 +410,8 @@ async function loadFixtures() {
         $("entityKey").value = tr.dataset.key;
         $("type").value = tr.dataset.type;
         log(`# Fixture selected: ${tr.dataset.title} (entity=${tr.dataset.key}, format=${tr.dataset.type})`);
+        // শুধু ভিউপোর্টে দেখানোর জন্য — এতে কোনো বেট হয় না
+        postJson("/api/preview", { entity_match_id: tr.dataset.key });
       });
     });
   } catch (e) {
@@ -400,6 +448,32 @@ window.addEventListener("DOMContentLoaded", () => {
     log("# Stop requested — disarming all workers…");
     await postJson("/api/stop-all", {});
     location.reload();
+  });
+
+  // Kill-switch: ON করলে কোনো বেট যাবে না; আবার চাপলে Resume (Mulling আবার চালু করতে হবে)
+  $("bKill").addEventListener("click", async () => {
+    const res = await postJson(S.guardKilled ? "/api/guard/resume" : "/api/guard/kill", {});
+    if (res?.status === "success") {
+      log(`# ${res.message}`, !S.guardKilled);
+    } else {
+      log(`# ❌ ${res?.message || "Kill-switch request failed"}`, true);
+    }
+  });
+
+  // Match URL পেস্ট করলে তা থেকে Melbet match key বের করে ফিল্ডে বসায় (Lock করার আগে পর্যন্ত)
+  let parseTimer = null;
+  $("matchUrl").addEventListener("input", () => {
+    clearTimeout(parseTimer);
+    parseTimer = setTimeout(async () => {
+      if (S.isLocked) return;
+      const url = $("matchUrl").value.trim();
+      if (!url) return;
+      const res = await postJson("/api/parse-match-url", { url });
+      if (res?.status === "success") {
+        $("matchKey").value = res.match_id;
+        log(`# Match URL থেকে ম্যাচ আইডি: ${res.match_id}`);
+      }
+    }, 400);
   });
 
   $("lockBtn").addEventListener("click", async () => {
@@ -494,6 +568,7 @@ window.addEventListener("DOMContentLoaded", () => {
       const kind = btn.dataset.kind;
       const wanted = !S.mulling[kind];
       if (wanted) {
+        if (S.guardKilled) return log("# Kill-switch ON — আগে Resume করুন", true);
         if (!S.isVerified) return log("# Verify a match first", true);
         if (!S.activeEntityId) return log("# No active entity match", true);
         if ((kind === "batsman" || kind === "wicket") && !S.workerLaunched[kind])
