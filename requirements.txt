@@ -1,1 +1,10 @@
-
+fastapi
+uvicorn[standard]
+httpx
+websockets
+python-dotenv
+orjson
+psutil
+uvloop; sys_platform != "win32"
+winloop; sys_platform == "win32"
+patchright
