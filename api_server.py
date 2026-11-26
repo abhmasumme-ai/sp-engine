@@ -34,6 +34,7 @@ from delivery_worker import DeliveryWorker
 from batsman_worker import BatsmanWorker
 from wicket_worker import WicketWorker
 
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # startup
@@ -43,8 +44,6 @@ async def lifespan(_app: FastAPI):
     elif entity_push_task is None or entity_push_task.done():
         entity_push_task = asyncio.create_task(entity_push_listener())
 
-    # Background: warm up fixture cache so `teams` can be resolved even if
-    # Entity push arrives without match_info
     if ENTITY_API_TOKEN and ENTITY_REST_BASE:
         _spawn(_prefetch_fixtures())
 
@@ -194,7 +193,7 @@ armed_workers: set = set()
 entity_fixture_cache: dict[str, dict] = {}
 entity_last_state: dict[str, dict] = {}
 preview_entity_match_id = None
-_last_seen_entity_mid = None   # UI-তে শেষ যেই match এর data broadcast হয়েছে
+_last_seen_entity_mid = None
 _entity_debug_log = deque(maxlen=20)
 
 entity_push_state = {
@@ -398,8 +397,53 @@ def _guard_payload() -> dict:
     return {"type": "guard_status", **guard.status()}
 
 
+def fetch_entity_fixtures(status: str) -> list:
+    """Entity REST — best effort. Free token-এ খালি আসতে পারে, চিন্তা নেই।"""
+    q = urlencode({"token": ENTITY_API_TOKEN, "status": status,
+                   "per_page": 50, "paged": 1})
+    req = URLRequest(f"{ENTITY_REST_BASE}/matches?{q}",
+                     headers={"Accept": "application/json"})
+    try:
+        with urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except HTTPError as e:
+        raise RuntimeError(f"Entity REST HTTP {e.code}") from None
+    except (URLError, TimeoutError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"Entity REST ({type(e).__name__})") from None
+
+    if not isinstance(data, dict) or data.get("status") != "ok":
+        raise RuntimeError("Entity Sports invalid response")
+
+    rd = data.get("response")
+    items = rd.get("items", []) if isinstance(rd, dict) else []
+    if not isinstance(items, list):
+        raise RuntimeError("Entity Sports invalid list")
+
+    out = []
+    for it in items:
+        if not isinstance(it, dict) or not it.get("match_id"):
+            continue
+        ta = it.get("teama") if isinstance(it.get("teama"), dict) else {}
+        tb = it.get("teamb") if isinstance(it.get("teamb"), dict) else {}
+        title = (it.get("title") or it.get("short_title")
+                 or " vs ".join(n for n in (ta.get("name"), tb.get("name")) if n)
+                 or "Unknown match")
+        out.append({
+            "match_id": str(it["match_id"]), "title": title,
+            "format": it.get("format_str") or "—",
+            "status": it.get("status_str") or {
+                "3": "Live", "1": "Upcoming", "2": "Completed", "4": "Cancelled"
+            }.get(status, "Unknown"),
+            "date_start": it.get("date_start_ist") or it.get("date_start") or "",
+        })
+    return out
+
+
 async def _prefetch_fixtures():
-    """Startup-এ live+upcoming fixture cache ভরে দেয়, যাতে match_info ছাড়া push এলেও teams দেখানো যায়।"""
+    """Best-effort — REST fail করলেও crash করবে না। Push cache পরে ভরে দেবে।"""
+    if not (ENTITY_API_TOKEN and ENTITY_REST_BASE):
+        print("[prefetch] skipped (no REST token/base)")
+        return
     try:
         groups = await asyncio.gather(
             *(asyncio.to_thread(fetch_entity_fixtures, s) for s in ("3", "1")),
@@ -408,14 +452,14 @@ async def _prefetch_fixtures():
         count = 0
         for g in groups:
             if isinstance(g, Exception):
-                print(f"[prefetch] {g}")
+                print(f"[prefetch] {type(g).__name__}: {g}")
                 continue
             for f in g:
                 entity_fixture_cache[f["match_id"]] = f
                 count += 1
-        print(f"[prefetch] cached {count} fixtures")
+        print(f"[prefetch] cached {count} fixtures from REST")
     except Exception as e:
-        print(f"[prefetch] failed: {e}")
+        print(f"[prefetch] failed: {type(e).__name__}: {e}")
 
 
 # ============================================================
@@ -496,7 +540,6 @@ async def _handle_entity_message(payload: dict):
         print(f"[entity] New match seen: mid={mid} keys={list(rd.keys())} has_mi={bool(mi)}")
 
     # -------- Focus / show decision --------
-    # Priority: preview (user click) > active (verified) > last-seen (first push ever)
     if preview_entity_match_id:
         is_shown = (mid == str(preview_entity_match_id))
     elif active_entity_match_id:
@@ -516,7 +559,6 @@ async def _handle_entity_message(payload: dict):
     if mi:
         ta = mi.get("teama") if isinstance(mi.get("teama"), dict) else {}
         tb = mi.get("teamb") if isinstance(mi.get("teamb"), dict) else {}
-        # Only cache when real info present (avoid "Unknown match" overwriting good cache)
         if ta.get("name") or tb.get("name") or mi.get("title") or mi.get("short_title"):
             entity_fixture_cache[mid] = _fixture_from_push(mid, mi)
             teams = " vs ".join(n for n in (ta.get("name"), tb.get("name")) if n) or mi.get("title") or ""
@@ -637,41 +679,6 @@ async def entity_push_listener():
             await manager.broadcast({"type": "entity_push_status", **entity_push_state})
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
-
-
-def fetch_entity_fixtures(status: str) -> list:
-    q = urlencode({"token": ENTITY_API_TOKEN, "status": status, "per_page": 50, "paged": 1})
-    req = URLRequest(f"{ENTITY_REST_BASE}/matches?{q}", headers={"Accept": "application/json"})
-    try:
-        with urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode("utf-8"))
-    except HTTPError as e:
-        raise RuntimeError(f"Entity Sports HTTP {e.code}") from None
-    except (URLError, TimeoutError, json.JSONDecodeError) as e:
-        raise RuntimeError(f"Entity Sports ({type(e).__name__})") from None
-    if not isinstance(data, dict) or data.get("status") != "ok":
-        raise RuntimeError("Entity Sports invalid response")
-    rd = data.get("response")
-    items = rd.get("items", []) if isinstance(rd, dict) else []
-    if not isinstance(items, list):
-        raise RuntimeError("Entity Sports invalid list")
-    out = []
-    for it in items:
-        if not isinstance(it, dict) or not it.get("match_id"):
-            continue
-        ta = it.get("teama") if isinstance(it.get("teama"), dict) else {}
-        tb = it.get("teamb") if isinstance(it.get("teamb"), dict) else {}
-        title = (it.get("title") or it.get("short_title")
-                 or " vs ".join(n for n in (ta.get("name"), tb.get("name")) if n)
-                 or "Unknown match")
-        out.append({
-            "match_id": str(it["match_id"]), "title": title,
-            "format": it.get("format_str") or "—",
-            "status": it.get("status_str") or {"3": "Live", "1": "Upcoming",
-                                                "2": "Completed", "4": "Cancelled"}.get(status, "Unknown"),
-            "date_start": it.get("date_start_ist") or it.get("date_start") or "",
-        })
-    return out
 
 
 # ============================================================
@@ -858,7 +865,6 @@ class PreviewRequest(BaseModel):
 
 @app.post("/api/parse-match-url")
 async def parse_match_url(data: UrlRequest):
-    """Match URL থেকে Melbet ম্যাচ আইডি বের করে (Verify-এর একই লজিক)।"""
     mid = _extract_game_id((data.url or "").strip())
     if not mid:
         return {"status": "error", "message": "URL থেকে ম্যাচ আইডি পাওয়া যায়নি"}
@@ -867,7 +873,6 @@ async def parse_match_url(data: UrlRequest):
 
 @app.post("/api/preview")
 async def set_preview(data: PreviewRequest):
-    """ফিক্সচার সিলেক্ট করলে ভিউপোর্টে ওই ম্যাচের ডেটা দেখানোর জন্য। এতে কোনো বেট হয় না।"""
     global preview_entity_match_id
     mid = (data.entity_match_id or "").strip()
     preview_entity_match_id = mid or None
@@ -920,7 +925,7 @@ async def verify_match_url(data: VerifyRequest):
 
     current_match_id = locked_melbet_id
     active_entity_match_id = data.entity_match_id
-    preview_entity_match_id = None   # preview reset — focus goes back to active
+    preview_entity_match_id = None
     verified_match_url = data.url.strip()
 
     fixture = entity_fixture_cache.get(active_entity_match_id, {})
@@ -1055,7 +1060,6 @@ async def reset_browser():
 
 @app.post("/api/stop-all")
 async def stop_all():
-    """Disarm every worker immediately (used by the UI Stop button)."""
     armed_workers.clear()
     for k in ("delivery", "batsman", "wicket"):
         await manager.broadcast({"type": "mulling_status", "worker": k, "enabled": False})
@@ -1079,7 +1083,7 @@ async def get_status():
 
 
 # ============================================================
-#  Debug (useful when UI shows nothing)
+#  Debug
 # ============================================================
 @app.get("/api/debug/entity")
 async def debug_entity():
@@ -1096,7 +1100,7 @@ async def debug_entity():
 
 
 # ============================================================
-#  Bet guard (kill-switch + limits)
+#  Bet guard
 # ============================================================
 @app.get("/api/guard")
 async def get_guard():
@@ -1105,7 +1109,6 @@ async def get_guard():
 
 @app.post("/api/guard/kill")
 async def guard_kill():
-    """Kill-switch ON: নতুন কোনো বেট যাবে না এবং সব worker disarm হবে।"""
     guard.kill()
     armed_workers.clear()
     await manager.broadcast(_guard_payload())
@@ -1116,7 +1119,6 @@ async def guard_kill():
 
 @app.post("/api/guard/resume")
 async def guard_resume():
-    """Kill-switch OFF। Worker আবার Mulling দিয়ে চালু করতে হবে।"""
     guard.resume()
     await manager.broadcast(_guard_payload())
     return {"status": "success", "message": "Kill-switch OFF — আবার Mulling চালু করুন"}
@@ -1127,28 +1129,33 @@ async def guard_resume():
 # ============================================================
 @app.get("/api/fixtures")
 async def get_fixtures():
-    if (not ENTITY_API_TOKEN or not ENTITY_REST_BASE) and not entity_fixture_cache:
-        raise HTTPException(status_code=503, detail="Entity Sports token/base URL missing")
+    """Push cache প্রথমে; REST best-effort (free token-এ খালি এলেও সমস্যা নেই)।"""
     by_id = dict(entity_fixture_cache)
+
     if ENTITY_API_TOKEN and ENTITY_REST_BASE:
-        groups = await asyncio.gather(
-            *(asyncio.to_thread(fetch_entity_fixtures, s) for s in ("3", "1", "2", "4")),
-            return_exceptions=True,
-        )
-        errs = []
-        for g in groups:
-            if isinstance(g, Exception):
-                errs.append(str(g))
-                continue
-            for f in g:
-                by_id[f["match_id"]] = f
-                entity_fixture_cache[f["match_id"]] = f
-        if not by_id and errs:
-            raise HTTPException(status_code=502, detail=" | ".join(errs))
-    so = {"live": 0, "started": 0, "3": 0, "upcoming": 1, "not started": 1, "1": 1,
+        try:
+            groups = await asyncio.gather(
+                *(asyncio.to_thread(fetch_entity_fixtures, s) for s in ("3", "1", "2", "4")),
+                return_exceptions=True,
+            )
+            for g in groups:
+                if isinstance(g, Exception):
+                    print(f"[fixtures] REST {type(g).__name__}: {g}")
+                    continue
+                for f in g:
+                    by_id[f["match_id"]] = f
+                    entity_fixture_cache[f["match_id"]] = f
+        except Exception as e:
+            print(f"[fixtures] REST failed: {e}")
+
+    so = {"live": 0, "started": 0, "3": 0,
+          "upcoming": 1, "not started": 1, "1": 1,
           "completed": 2, "2": 2, "cancelled": 3, "4": 3}
     fixtures = sorted(by_id.values(), key=lambda f: (
-        so.get(str(f["status"]).lower(), 4), f["date_start"], f["title"]))
+        so.get(str(f["status"]).lower(), 4),
+        f.get("date_start", ""),
+        f.get("title", ""),
+    ))
     return {"status": "success", "fixtures": fixtures}
 
 
@@ -1211,6 +1218,7 @@ async def bet_delivery():
     _spawn(worker_delivery.on_dot_ball(over_num=3, ball_num=5))
     return {"status": "success", "message": "Delivery bet fired"}
 
+
 class BatsmanBetRequest(BaseModel):
     striker_name: str = ""
 
@@ -1224,6 +1232,7 @@ async def bet_batsman(data: BatsmanBetRequest):
         return {"status": "error", "message": "striker_name required"}
     _spawn(worker_batsman.on_batsman_runs(striker_name=name, line_value="31.5"))
     return {"status": "success", "message": f"Batsman bet fired for {name}"}
+
 
 @app.post("/api/bet/wicket")
 async def bet_wicket():
@@ -1263,13 +1272,16 @@ async def entity_webhook(request: Request):
 async def serve_ui():
     return FileResponse(BASE_DIR / "index.html", media_type="text/html")
 
+
 @app.get("/index.css")
 async def serve_stylesheet():
     return FileResponse(BASE_DIR / "index.css", media_type="text/css")
 
+
 @app.get("/script.js")
 async def serve_script():
     return FileResponse(BASE_DIR / "script.js", media_type="application/javascript")
+
 
 @app.get("/favicon.ico")
 async def favicon():
