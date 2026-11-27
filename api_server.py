@@ -35,6 +35,72 @@ from batsman_worker import BatsmanWorker
 from wicket_worker import WicketWorker
 
 
+# ============================================================
+#  🔍 TEMP DEBUG: Entity raw payload logger
+#  ------------------------------------------------------------
+#  entity_raw.log-এ প্রতিটি message "[tag] {json}" লাইনে সেভ হবে।
+#  ডেটা সংগ্রহ শেষ হলে এই ব্লক + call site দুটোই মুছে দেবেন।
+#  বন্ধ করতে: .env-এ ENTITY_RAW_LOG=0 সেট করুন।
+# ============================================================
+ENTITY_RAW_LOG = os.getenv("ENTITY_RAW_LOG", "1").lower() in ("1", "true", "yes", "on")
+_RAW_LOG_PATH = Path(__file__).resolve().parent / "entity_raw.log"
+_RAW_LOG_MAX_BYTES = 25 * 1024 * 1024  # 25 MB cap — নিরাপত্তার জন্য
+_RAW_LOG_COUNT = 0
+
+
+def _classify_raw_for_log(p: dict) -> str:
+    """Log line-এ [tag] যোগ করার জন্য — grep সহজ করতে।"""
+    rd = p.get("response") if isinstance(p.get("response"), dict) else {}
+    be = rd.get("ball_event")
+    if be:
+        if isinstance(be, dict):
+            ev = str(be.get("ev") or be.get("event") or "").strip().lower()
+        else:
+            ev = str(be).strip().lower()
+        if ev in ("4", "four"):
+            return "four"
+        if ev in ("6", "six"):
+            return "six"
+        if ev in ("w", "wicket", "out", "bowled", "lbw", "caught", "stumped",
+                  "run out", "runout", "hit wicket"):
+            return "wicket"
+        if ev in ("wd", "wide"):
+            return "wide"
+        if ev in ("nb", "noball", "no ball", "noball"):
+            return "noball"
+        if ev in ("0", "dot"):
+            return "dot"
+        return f"ball:{ev or 'unknown'}"
+    if rd.get("match_info"):
+        return "match_info"
+    if rd.get("live"):
+        return "live"
+    return "other"
+
+
+def _log_entity_raw(p: dict):
+    """Raw payload ফাইলে লিখে রাখে। Safe — exception হলে ফেটে যাবে না।"""
+    global _RAW_LOG_COUNT
+    if not ENTITY_RAW_LOG:
+        return
+    try:
+        if _RAW_LOG_PATH.exists() and _RAW_LOG_PATH.stat().st_size > _RAW_LOG_MAX_BYTES:
+            return  # cap-এ পৌঁছেছে, আর লিখছে না
+        tag = _classify_raw_for_log(p)
+        line = f"[{tag}] " + json.dumps(p, ensure_ascii=False) + "\n"
+        with _RAW_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line)
+        _RAW_LOG_COUNT += 1
+        if _RAW_LOG_COUNT % 100 == 0:
+            size_kb = _RAW_LOG_PATH.stat().st_size // 1024
+            print(f"[entity-raw] {_RAW_LOG_COUNT} msgs logged ({size_kb} KB) → {_RAW_LOG_PATH.name}")
+    except Exception as e:
+        print(f"[entity-raw] log failed: {type(e).__name__}: {e}")
+
+
+# ============================================================
+#  FastAPI lifespan
+# ============================================================
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     # startup
@@ -663,6 +729,10 @@ async def entity_push_listener():
                         continue
                     if not isinstance(p, dict):
                         continue
+
+                    # 🔍 TEMP DEBUG — entity_raw.log-এ সেভ
+                    _log_entity_raw(p)
+
                     entity_push_state["messages"] += 1
                     entity_push_state["last_message_at"] = time.time()
                     try:
@@ -1096,6 +1166,23 @@ async def debug_entity():
         "known_matches": list(entity_last_state.keys()),
         "cached_fixtures": {k: v.get("title") for k, v in entity_fixture_cache.items()},
         "recent_messages": list(_entity_debug_log),
+    }
+
+
+@app.get("/api/debug/entity/raw-info")
+async def debug_entity_raw_info():
+    """entity_raw.log-এর স্ট্যাটাস — কত MB হয়েছে, কত message সেভ হয়েছে।"""
+    exists = _RAW_LOG_PATH.exists()
+    size = _RAW_LOG_PATH.stat().st_size if exists else 0
+    return {
+        "status": "success",
+        "enabled": ENTITY_RAW_LOG,
+        "path": str(_RAW_LOG_PATH),
+        "exists": exists,
+        "size_bytes": size,
+        "size_mb": round(size / (1024 * 1024), 2),
+        "logged_count": _RAW_LOG_COUNT,
+        "cap_mb": _RAW_LOG_MAX_BYTES // (1024 * 1024),
     }
 
 
